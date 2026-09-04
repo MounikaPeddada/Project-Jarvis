@@ -3,25 +3,31 @@ import sys
 import json
 import re
 import asyncio
-import time
+import logging
 from dataclasses import dataclass
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 from dotenv import load_dotenv
 
-# Add parent directory to path so we can import tools
+# Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import google.genai as genai  # NEW: use google.genai instead
 from tools.tool_registry import TOOLS_LIST, TOOL_FUNCTIONS
+from brain.brain import call_gemini
+from memory.database import log_interaction, remember, recall
 
+# Load environment variables
 load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY")
-if not api_key:
-    raise Exception("❌ GEMINI_API_KEY not found in .env file!")
 
-client = genai.Client(api_key=api_key)
+# Constants
+MAX_INPUT_LENGTH = 1000
+API_TIMEOUT = 15.0
 
-
+# System Prompt (Phase 1 + Phase 2)
 SYSTEM_PROMPT = """
 You are Jarvis, a helpful desktop assistant. Address the user as 'ma'am'.
 
@@ -31,11 +37,18 @@ Do NOT add any extra text before or after the JSON.
 For single tool: {"tool": "get_time", "args": {}}
 For multiple tools: [{"tool": "tool1", "args": {}}, {"tool": "tool2", "args": {}}]
 
+AVAILABLE TOOLS:
+- get_time: Gets the current date and time.
+- echo: Repeats back whatever the user said.
+- add_numbers: Adds two numbers together.
+- remember: Saves a fact to long-term memory.
+- recall: Retrieves facts from memory.
+- add_task: Adds a task to the to-do list.
+- list_tasks: Lists all tasks.
+- complete_task: Marks a task as complete.
+
 If you don't need a tool, reply naturally without any JSON.
 """
-
-DEFAULT_MAX_TOKENS = 500
-FINAL_RESPONSE_TOKENS = 300
 
 @dataclass
 class ToolCall:
@@ -43,8 +56,43 @@ class ToolCall:
     tool: str
     args: Dict[str, Any]
 
+class ToolValidator:
+    """Validates tool arguments against schema."""
+    
+    @staticmethod
+    def validate(tool_name: str, tool_args: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        Validate tool arguments.
+        Returns: (is_valid, error_message)
+        """
+        # Find tool schema
+        tool_schema = None
+        for tool in TOOLS_LIST:
+            if tool["name"] == tool_name:
+                tool_schema = tool
+                break
+        
+        if not tool_schema:
+            return False, f"Tool '{tool_name}' not found in registry"
+        
+        # Get properties
+        properties = tool_schema.get("input_schema", {}).get("properties", {})
+        
+        # Check for missing required arguments
+        required = tool_schema.get("input_schema", {}).get("required", [])
+        for prop_name in required:
+            if prop_name not in tool_args:
+                return False, f"Missing required argument '{prop_name}' for tool '{tool_name}'"
+        
+        # Check for unexpected arguments
+        for arg_name in tool_args:
+            if arg_name not in properties:
+                logger.warning(f"Unexpected argument '{arg_name}' for tool '{tool_name}'")
+        
+        return True, ""
+
 class ToolCallParser:
-    """Optimized tool call parser with support for batch tool calls."""
+    """Robust JSON extractor that searches anywhere in the response."""
     
     JSON_PATTERN = re.compile(r'\[\s*\{[^[\]]*\}\s*(?:,\s*\{[^[\]]*\})*\s*\]|\{[^{}]*"tool"[^{}]*"args"[^{}]*\}')
     
@@ -66,10 +114,12 @@ class ToolCallParser:
                 elif isinstance(data, dict) and "tool" in data and "args" in data:
                     tool_calls.append(ToolCall(tool=data["tool"], args=data["args"]))
                 
+                logger.debug(f"Parsed {len(tool_calls)} tool call(s)")
                 return tool_calls
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON parsing failed: {str(e)}")
         
+        # Fallback: brace matching
         return ToolCallParser._parse_with_braces(response_text)
     
     @staticmethod
@@ -105,15 +155,24 @@ class ToolBatcher:
     
     @staticmethod
     async def execute_tool_async(tool_name: str, tool_args: Dict[str, Any]) -> Tuple[str, Any]:
-        """Execute single tool asynchronously."""
+        """Execute single tool asynchronously with validation."""
         try:
+            # Validate arguments first
+            is_valid, error_msg = ToolValidator.validate(tool_name, tool_args)
+            if not is_valid:
+                logger.error(f"Validation error for tool '{tool_name}': {error_msg}")
+                return (tool_name, f"Error: {error_msg}")
+            
             if tool_name in TOOL_FUNCTIONS:
                 result = TOOL_FUNCTIONS[tool_name](**tool_args)
+                logger.info(f"✅ Tool '{tool_name}' executed successfully")
                 return (tool_name, result)
             else:
+                logger.error(f"Tool '{tool_name}' not found in TOOL_FUNCTIONS")
                 return (tool_name, f"Unknown tool '{tool_name}'")
         except Exception as e:
-            return (tool_name, f"Error: {str(e)}")
+            logger.error(f"Tool '{tool_name}' execution failed: {str(e)}", exc_info=True)
+            return (tool_name, f"Error executing tool: {str(e)}")
     
     @staticmethod
     async def execute_tools_in_parallel(tool_calls: List[ToolCall]) -> Dict[str, Any]:
@@ -130,13 +189,13 @@ class ToolBatcher:
         return {tool_name: result for tool_name, result in results}
 
 class JarvisAgent:
-    """Main Jarvis AI Agent."""
+    """Main Jarvis AI Agent with improved error handling."""
     
     def __init__(self):
         self.parser = ToolCallParser()
         self.batcher = ToolBatcher()
         self._build_tool_descriptions()
-        self.chat=client.chats.create(model="gemini-3.7-flash")  # Create a chat session for tool use
+        logger.info("🦾 Jarvis Agent initialized")
     
     def _build_tool_descriptions(self):
         """Pre-build tool descriptions."""
@@ -145,78 +204,118 @@ class JarvisAgent:
             for t in TOOLS_LIST
         ])
     
-    def _call_gemini(self, prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS) -> str:
-        """Call Gemini API with retry logic."""
-        max_retries = 2
-        for attempt in range(max_retries):
-            try:
-                #create a chat session for tool use
-                start=time.time()
-                response = self.chat.send_message(
-                    prompt,
-                    config={
-                        "max_output_tokens":max_tokens,
-
-                    }
-                )
-                elapsed = time.time() - start
-                print(f"⏱️ API call took {elapsed:.2f} seconds")
-
-                return response.text
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    continue
-                else:
-                    raise Exception(f"❌ API Error: {str(e)}")
-    
-    async def _execute_tool_batch(self, tool_calls: List[ToolCall]) -> Dict[str, Any]:
-        """Execute batch of tools in parallel."""
-        if not tool_calls:
-            return {}
+    def _sanitize_input(self, user_input: str) -> Tuple[bool, str]:
+        """
+        Sanitize user input.
+        Returns: (is_valid, sanitized_input)
+        """
+        if not user_input:
+            return False, "Input is empty"
         
-        print(f"🔧 Executing {len(tool_calls)} tool(s): {', '.join(tc.tool for tc in tool_calls)}")
-        return await self.batcher.execute_tools_in_parallel(tool_calls)
+        if len(user_input) > MAX_INPUT_LENGTH:
+            return False, f"Input too long (max {MAX_INPUT_LENGTH} characters)"
+        
+        return True, user_input.strip()
     
     def process_command(self, user_input: str) -> str:
-        """Process a user command and execute tools if needed."""
+        """Process a user command, log everything, and return a response."""
+        
+        # Sanitize input
+        is_valid, sanitized = self._sanitize_input(user_input)
+        if not is_valid:
+            error_msg = f"Invalid input: {sanitized}"
+            logger.warning(error_msg)
+            log_interaction(command=user_input, error=error_msg)
+            return error_msg
+        
+        logger.info(f"Processing command: {sanitized[:100]}...")
         
         decision_prompt = f"""{SYSTEM_PROMPT}
 
 AVAILABLE TOOLS:
 {self.tool_descriptions}
 
-User command: {user_input}
+User command: {sanitized}
 """
         
-        response_text = self._call_gemini(decision_prompt)
-        tool_calls = self.parser.parse(response_text)
-        
-        if tool_calls:
-            try:
-                results = asyncio.run(self._execute_tool_batch(tool_calls))
-                
-                results_str = "\n".join([f"{tool}: {result}" for tool, result in results.items()])
-                
-                final_prompt = f"""You executed tools and got results. Provide a natural response.
+        try:
+            # Step 1: Get decision from Brain
+            response_text = call_gemini(decision_prompt)
+            tool_calls = self.parser.parse(response_text)
+            
+            if tool_calls:
+                try:
+                    # Step 2: Execute tools in parallel with timeout protection
+                    results = asyncio.run(asyncio.wait_for(
+                        self._execute_tool_batch(tool_calls),
+                        timeout=API_TIMEOUT
+                    ))
+                    
+                    tools_used = ', '.join([tc.tool for tc in tool_calls])
+                    results_str = "\n".join([f"{tool}: {result}" for tool, result in results.items()])
+                    
+                    # Step 3: Get final reply from Brain
+                    final_prompt = f"""You executed tools and got results. Provide a natural response.
 
-User asked: "{user_input}"
-Tools executed: {', '.join([tc.tool for tc in tool_calls])}
+User asked: "{sanitized}"
+Tools executed: {tools_used}
 Tool results:
 {results_str}
 
-Give a concise, helpful response."""
+Give a concise, helpful response based on these results."""
+                    
+                    final_response = call_gemini(final_prompt)
+                    
+                    # Step 4: LOG EVERYTHING to history
+                    log_interaction(
+                        command=sanitized,
+                        tool_called=tools_used,
+                        result=results_str,
+                        error=None
+                    )
+                    
+                    logger.info(f"✅ Command processed successfully")
+                    return final_response
                 
-                final_response = self._call_gemini(final_prompt, FINAL_RESPONSE_TOKENS)
-                return final_response
-                
-            except Exception as e:
-                return f"Error executing tools: {str(e)}"
-        else:
-            return response_text
+                except asyncio.TimeoutError:
+                    error_msg = f"Tool execution timeout (max {API_TIMEOUT}s)"
+                    logger.error(error_msg)
+                    log_interaction(command=sanitized, error=error_msg)
+                    return error_msg
+                except Exception as e:
+                    error_msg = f"Error executing tools: {str(e)}"
+                    logger.error(error_msg, exc_info=True)
+                    log_interaction(command=sanitized, error=error_msg)
+                    return error_msg
+            else:
+                # No tool called — just reply naturally
+                logger.info("No tools needed for this command")
+                log_interaction(
+                    command=sanitized,
+                    tool_called=None,
+                    result=response_text,
+                    error=None
+                )
+                return response_text
+        
+        except Exception as e:
+            error_msg = f"Error processing command: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            log_interaction(command=sanitized, error=error_msg)
+            return error_msg
+    
+    async def _execute_tool_batch(self, tool_calls: List[ToolCall]) -> Dict[str, Any]:
+        """Execute batch of tools in parallel."""
+        if not tool_calls:
+            return {}
+        
+        logger.info(f"🔧 Executing {len(tool_calls)} tool(s): {', '.join(tc.tool for tc in tool_calls)}")
+        return await self.batcher.execute_tools_in_parallel(tool_calls)
     
     def run_interactive(self):
         """Run interactive mode."""
         print("🦾 Jarvis is online. Type 'exit' to quit.\n")
+        logger.info("Agent started in interactive mode")
         
         while True:
             try:
@@ -227,6 +326,7 @@ Give a concise, helpful response."""
                 
                 if user_input.lower() in ["exit", "quit", "bye"]:
                     print("Jarvis: Goodbye!")
+                    logger.info("Agent shutdown requested by user")
                     break
                 
                 response = self.process_command(user_input)
@@ -234,10 +334,17 @@ Give a concise, helpful response."""
                 
             except KeyboardInterrupt:
                 print("\nJarvis: Interrupted. Goodbye!")
+                logger.info("Agent interrupted by user (KeyboardInterrupt)")
                 break
             except Exception as e:
-                print(f"❌ Error: {str(e)}\n")
+                error_msg = f"❌ Error: {str(e)}"
+                print(f"{error_msg}\n")
+                logger.error(error_msg, exc_info=True)
 
 if __name__ == "__main__":
-    agent = JarvisAgent()
-    agent.run_interactive()
+    try:
+        agent = JarvisAgent()
+        agent.run_interactive()
+    except Exception as e:
+        logger.critical(f"Fatal error: {str(e)}", exc_info=True)
+        print(f"❌ Fatal error: {str(e)}")
