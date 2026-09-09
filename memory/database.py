@@ -170,7 +170,7 @@ def log_interaction(command: str, tool_called: Optional[str] = None, result: Opt
     except Exception as e:
         logger.error(f"Failed to log interaction: {str(e)}")
 
-def remember(fact: str, category: str = "general") -> bool:
+def remember(fact: str, category: str = "general") -> str:
     """
     Save a fact to memory.
     
@@ -179,11 +179,11 @@ def remember(fact: str, category: str = "general") -> bool:
         category: Category for organization
     
     Returns:
-        True if successful, False otherwise
+        Message indicating success or failure
     """
     if not isinstance(fact, str) or not fact.strip():
         logger.warning("Invalid fact: must be non-empty string")
-        return False
+        return "❌ Invalid fact: must be non-empty string"
     
     try:
         manager = DatabaseManager()
@@ -199,16 +199,16 @@ def remember(fact: str, category: str = "general") -> bool:
         )
         conn.commit()
         logger.info(f"✅ Remembered: {fact[:50]}...")
-        return True
+        return f"✅ I'll remember that: '{fact}'"  # <-- Return a string
         
     except sqlite3.IntegrityError:
         logger.warning(f"Fact already exists: {fact[:50]}...")
-        return False
+        return f"⚠️ I already know that: '{fact}'"  # <-- Return a string
     except Exception as e:
         logger.error(f"Failed to remember fact: {str(e)}")
-        return False
+        return f"❌ Failed to remember: {str(e)}"  # <-- Return error as string
 
-def recall(category: Optional[str] = None) -> list:
+def recall(category: Optional[str] = None) -> str: 
     """
     Retrieve facts from memory.
     
@@ -230,21 +230,28 @@ def recall(category: Optional[str] = None) -> list:
         
         facts = [row[0] for row in cursor.fetchall()]
         logger.debug(f"Recalled {len(facts)} facts")
-        return facts
+        if not facts:
+            return "I don't remember anything about that."
+        
+        # Format as a readable string
+        output = "Here's what I remember:\n"
+        for fact in facts:
+            output += f"• {fact}\n"
+        return output
         
     except Exception as e:
         logger.error(f"Failed to recall facts: {str(e)}")
-        return []
+        return f"❌ Failed to recall: {str(e)}"
 
-def get_history(limit: int = 100) -> list:
+def get_history(limit: int = 100) -> str:  # Keep -> str
     """
-    Get recent history entries.
+    Get recent history entries and return as formatted string.
     
     Args:
         limit: Max number of entries to return
     
     Returns:
-        List of history entries
+        Formatted string of recent history
     """
     try:
         manager = DatabaseManager()
@@ -256,12 +263,118 @@ def get_history(limit: int = 100) -> list:
             (limit,)
         )
         
-        return [dict(row) for row in cursor.fetchall()]
+        rows = cursor.fetchall()
+        
+        if not rows:
+            return "No history found."
+        
+        output = f"📜 Last {len(rows)} interactions:\n\n"
+        for row in rows:
+            # Convert to dict for easier access
+            entry = dict(row)
+            output += f"🕐 {entry['timestamp']}\n"
+            output += f"   Command: {entry['command']}\n"
+            if entry['tool_called']:
+                output += f"   Tool: {entry['tool_called']}\n"
+            if entry['result']:
+                output += f"   Result: {entry['result']}\n"
+            if entry['error']:
+                output += f"   ❌ Error: {entry['error']}\n"
+            output += "\n"
+        
+        return output
         
     except Exception as e:
         logger.error(f"Failed to get history: {str(e)}")
-        return []
+        return f"❌ Failed to get history: {str(e)}"
 
 if __name__ == "__main__":
     init_database()
     logger.info("Database ready!")
+
+
+def add_task(task: str, due_date: str = "") -> str:
+    """Add a task to the to-do list."""
+    if not isinstance(task, str) or not task.strip():
+        return "❌ Invalid task: must be non-empty string"
+    
+    try:
+        manager = DatabaseManager()
+        conn = manager.get_connection()
+        cursor = conn.cursor()
+        
+        task = task.strip()[:500]
+        due_date = due_date.strip()[:50] if due_date else None
+        
+        cursor.execute(
+            "INSERT INTO tasks (task, due_date) VALUES (?, ?)",
+            (task, due_date)
+        )
+        conn.commit()
+        
+        due_text = f" (due: {due_date})" if due_date else ""
+        return f"✅ Task added: '{task}'{due_text}"
+        
+    except Exception as e:
+        logger.error(f"Failed to add task: {str(e)}")
+        return f"❌ Failed to add task: {str(e)}"
+
+
+def list_tasks(status: str = "pending") -> str:
+    """List all tasks with optional status filter."""
+    valid_statuses = ["pending", "completed", "cancelled", "all"]
+    if status not in valid_statuses:
+        return f"❌ Invalid status. Use: {', '.join(valid_statuses)}"
+    
+    try:
+        manager = DatabaseManager()
+        conn = manager.get_connection()
+        cursor = conn.cursor()
+        
+        if status == "all":
+            cursor.execute("SELECT id, task, due_date, status FROM tasks ORDER BY timestamp DESC")
+        else:
+            cursor.execute(
+                "SELECT id, task, due_date, status FROM tasks WHERE status = ? ORDER BY timestamp DESC",
+                (status,)
+            )
+        
+        results = cursor.fetchall()
+        
+        if not results:
+            return f"No {status} tasks found."
+        
+        output = f"📋 {status.capitalize()} Tasks:\n"
+        for task_id, task, due_date, task_status in results:
+            due = f" (due: {due_date})" if due_date else ""
+            output += f"• [{task_id}] {task}{due} - {task_status}\n"
+        
+        return output
+        
+    except Exception as e:
+        logger.error(f"Failed to list tasks: {str(e)}")
+        return f"❌ Failed to list tasks: {str(e)}"
+
+
+def complete_task(task_id: int) -> str:
+    """Mark a task as complete."""
+    try:
+        manager = DatabaseManager()
+        conn = manager.get_connection()
+        cursor = conn.cursor()
+        
+        # Check if task exists first
+        cursor.execute("SELECT id FROM tasks WHERE id = ?", (task_id,))
+        if not cursor.fetchone():
+            return f"❌ Task {task_id} not found."
+        
+        cursor.execute(
+            "UPDATE tasks SET status = 'completed' WHERE id = ?",
+            (task_id,)
+        )
+        conn.commit()
+        return f"✅ Task {task_id} marked as complete!"
+        
+    except Exception as e:
+        logger.error(f"Failed to complete task: {str(e)}")
+        return f"❌ Failed to complete task: {str(e)}"

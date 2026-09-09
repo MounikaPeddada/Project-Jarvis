@@ -14,7 +14,7 @@ api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
     raise Exception("❌ GEMINI_API_KEY not found in .env file!")
 
-genai.configure(api_key=api_key)
+_client = genai.Client(api_key=api_key)  # ✅ This is correct!
 
 # Initialize client (singleton pattern)
 _client = None

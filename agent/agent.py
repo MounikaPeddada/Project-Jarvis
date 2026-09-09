@@ -324,7 +324,7 @@ Give a concise, helpful response based on these results."""
                 if not user_input:
                     continue
                 
-                if user_input.lower() in ["exit", "quit", "bye"]:
+                if "exit" in user_input.lower() or "quit" in user_input.lower() or "bye" in user_input.lower():
                     print("Jarvis: Goodbye!")
                     logger.info("Agent shutdown requested by user")
                     break
