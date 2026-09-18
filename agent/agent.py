@@ -18,18 +18,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools.tool_registry import TOOLS_LIST, TOOL_FUNCTIONS
 from brain.brain import call_gemini
-from memory.database import log_interaction, remember, recall
+from memory.database import log_interaction, remember, recall,init_database
 
 # Load environment variables
 load_dotenv()
 
 # Constants
 MAX_INPUT_LENGTH = 1000
-API_TIMEOUT = 15.0
+API_TIMEOUT = 60.0
 
 # System Prompt (Phase 1 + Phase 2)
 SYSTEM_PROMPT = """
 You are Jarvis, a helpful desktop assistant. Address the user as 'ma'am'.
+Always be concise and natural in responses.
 
 When you need to use a tool, reply with ONLY the JSON object(s).
 Do NOT add any extra text before or after the JSON.
@@ -48,6 +49,7 @@ AVAILABLE TOOLS:
 - complete_task: Marks a task as complete.
 
 If you don't need a tool, reply naturally without any JSON.
+Keep responses concise and helpful.
 """
 
 @dataclass
@@ -192,6 +194,7 @@ class JarvisAgent:
     """Main Jarvis AI Agent with improved error handling."""
     
     def __init__(self):
+        init_database()
         self.parser = ToolCallParser()
         self.batcher = ToolBatcher()
         self._build_tool_descriptions()
@@ -327,6 +330,13 @@ Give a concise, helpful response based on these results."""
                 if "exit" in user_input.lower() or "quit" in user_input.lower() or "bye" in user_input.lower():
                     print("Jarvis: Goodbye!")
                     logger.info("Agent shutdown requested by user")
+                    
+                    #adding obsidain sync before exit
+                    try:
+                        from memory.obsidian_sync import ObsidianSync
+                        ObsidianSync().sync_all()
+                    except Exception as e:
+                        logger.error(f"Obsidian sync failed : {e}")
                     break
                 
                 response = self.process_command(user_input)
@@ -335,6 +345,13 @@ Give a concise, helpful response based on these results."""
             except KeyboardInterrupt:
                 print("\nJarvis: Interrupted. Goodbye!")
                 logger.info("Agent interrupted by user (KeyboardInterrupt)")
+
+                #sync on ctr+c
+                try:
+                    from memory.obsidian_sync import ObsidianSync
+                    obsidainSync().sync_all()
+                except Exception as e:
+                    logger.error(f"Obsidian sync failed : {e}")
                 break
             except Exception as e:
                 error_msg = f"❌ Error: {str(e)}"

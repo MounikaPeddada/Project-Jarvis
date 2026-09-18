@@ -30,8 +30,9 @@ def get_client():
             logger.error(f"Failed to initialize Gemini client: {str(e)}")
             raise
     return _client
+    
 
-def call_gemini(prompt: str, max_retries: int = 3, timeout: float = 15.0) -> str:
+def call_gemini(prompt: str, max_retries: int = 1, timeout: float = 10.0) -> str:
     """
     Call Gemini API with automatic retry logic, timeout, and proper error handling.
     

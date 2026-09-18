@@ -8,7 +8,9 @@ from typing import Optional, Dict, Any
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-DB_PATH = "memory/jarvis_memory.db"
+#fixing the database initialization issue
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "jarvis_memory.db")
 
 class DatabaseManager:
     """Manages SQLite database with connection pooling and error handling."""
@@ -30,7 +32,8 @@ class DatabaseManager:
     def _ensure_db_exists(self):
         """Ensure database directory exists."""
         try:
-            os.makedirs("memory", exist_ok=True)
+            db_folder = os.path.dirname(self.db_path)
+            os.makedirs(db_folder, exist_ok=True)
         except Exception as e:
             logger.error(f"Failed to create memory directory: {str(e)}")
             raise
