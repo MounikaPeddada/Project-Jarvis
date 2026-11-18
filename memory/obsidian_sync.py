@@ -8,7 +8,7 @@ from memory.database import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
-VAULT_PATH = "obsidian_vault"
+VAULT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "obsidian_vault")
 
 class ObsidianSync:
     """Syncs SQLite database to Obsidian markdown notes."""

@@ -10,9 +10,9 @@ def get_date():
     now = datetime.datetime.now()
     return now.strftime("%B %d, %Y")
 
-def echo(message: str):
+def echo(text: str):
     """Repeats back a message."""
-    return f"Echo: {message}"
+    return f"Echo: {text}"
 
 def add_numbers(a: float, b: float):
     """Adds two numbers together."""

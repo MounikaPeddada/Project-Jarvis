@@ -1,146 +1,100 @@
 import os
 import time
 import logging
+import requests
 from dotenv import load_dotenv
-import google.genai as genai
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Load API key
-load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY")
-if not api_key:
-    raise Exception("❌ GEMINI_API_KEY not found in .env file!")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+CONNECT_TIMEOUT = 3                                   # offline server fails in 3s
+READ_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "120"))  # first call loads the model
 
-_client = genai.Client(api_key=api_key)  # ✅ This is correct!
 
-# Initialize client (singleton pattern)
-_client = None
+class BrainOfflineError(RuntimeError):
+    """Raised when the local Ollama server or model is unavailable."""
 
-def get_client():
-    """Get or create Gemini client (singleton)."""
-    global _client
-    if _client is None:
-        try:
-            _client = genai.Client(api_key=api_key)
-            logger.info("✅ Gemini client initialized")
-        except Exception as e:
-            logger.error(f"Failed to initialize Gemini client: {str(e)}")
-            raise
-    return _client
-    
 
-def call_gemini(prompt: str, max_retries: int = 1, timeout: float = 10.0) -> str:
-    """
-    Call Gemini API with automatic retry logic, timeout, and proper error handling.
-    
-    Args:
-        prompt: The prompt to send to Gemini.
-        max_retries: Number of retry attempts on failure.
-        timeout: Maximum wait time for API response (in seconds).
-    
-    Returns:
-        Gemini's response text.
-    
-    Raises:
-        Exception: If all retries fail
-    """
+def check_server() -> None:
+    """Raise a clear error if Ollama is down or the model isn't installed."""
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=CONNECT_TIMEOUT)
+        r.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise BrainOfflineError(
+            f"Ollama is not running at {OLLAMA_URL}. Start it with `ollama serve`."
+        ) from e
+    installed = [m["name"] for m in r.json().get("models", [])]
+    if MODEL not in installed and f"{MODEL}:latest" not in installed:
+        raise BrainOfflineError(f"Model '{MODEL}' not installed. Run: ollama pull {MODEL}")
+
+
+def call_llm(prompt: str, system: str | None = None,
+             temperature: float = 0.2, max_tokens: int = 300) -> str:
+    """Send one prompt to the local Ollama model and return the reply text."""
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("Prompt must be a non-empty string")
-    
-    client = get_client()
-    
-    for attempt in range(max_retries):
-        try:
-            start_time = time.time()
-            
-            logger.debug(f"API call attempt {attempt + 1}/{max_retries}")
-            
-            # Use new API with correct syntax
-            response = client.models.generate_content(
-                model="gemini-3.7-flash",
-                contents=prompt,
-                config={
-                    "temperature": 0.7,
-                    "max_output_tokens": 500,
-                }
-            )
-            
-            elapsed = time.time() - start_time
-            logger.info(f"✅ API call successful in {elapsed:.2f}s")
-            
-            # Warn if slow
-            if elapsed > timeout:
-                logger.warning(f"⚠️ API response slow: {elapsed:.2f}s (timeout: {timeout}s)")
-            
-            return response.text
-        
-        except Exception as e:
-            elapsed = time.time() - start_time
-            logger.error(f"API error on attempt {attempt + 1}/{max_retries}: {str(e)} (took {elapsed:.2f}s)")
-            
-            if attempt < max_retries - 1:
-                # Exponential backoff with max cap
-                wait_time = min(2 ** attempt, 8)  # 1s, 2s, 4s, max 8s
-                logger.info(f"Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-                continue
-            else:
-                logger.critical(f"❌ API Error after {max_retries} attempts: {str(e)}")
-                raise Exception(f"❌ Gemini API Error after {max_retries} attempts: {str(e)}")
 
-def call_gemini_with_chat(system_prompt: str, user_message: str, max_retries: int = 3) -> str:
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "stream": False,
+        "keep_alive": "30m",              # keep the model in VRAM between commands
+        "options": {
+            "temperature": temperature,
+            "num_predict": max_tokens,
+            "num_ctx": 4096,
+        },
+    }
+
+    start = time.time()
+    try:
+        r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload,
+                          timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+    except requests.exceptions.ConnectionError as e:
+        raise BrainOfflineError(
+            f"Ollama is not running at {OLLAMA_URL}. Start it with `ollama serve`."
+        ) from e
+    except requests.exceptions.Timeout as e:
+        raise BrainOfflineError(f"Ollama did not answer within {READ_TIMEOUT:.0f}s.") from e
+
+    if r.status_code == 404:
+        raise BrainOfflineError(f"Model '{MODEL}' not found. Run: ollama pull {MODEL}")
+    if r.status_code >= 400:
+        raise RuntimeError(f"Ollama error {r.status_code}: {r.text[:200]}")
+
+    text = r.json()["message"]["content"].strip()
+    logger.info(f"Local LLM replied in {time.time() - start:.2f}s")
+    return text
+
+
+def warm_up() -> None:
     """
-    Call Gemini using Chat interface for multi-turn conversations.
-    
-    Args:
-        system_prompt: System context/instructions
-        user_message: User's message
-        max_retries: Retry attempts
-    
-    Returns:
-        Gemini's response text
+    Load the model into VRAM now so the first user command isn't slow.
+    Sends a tiny prompt (max 1 token) just to force Ollama to load the model.
     """
-    if not isinstance(user_message, str) or not user_message.strip():
-        raise ValueError("User message must be non-empty string")
-    
-    client = get_client()
-    
-    for attempt in range(max_retries):
-        try:
-            start_time = time.time()
-            
-            # Create chat session
-            chat = client.chats.create(model="gemini-3.7-flash")
-            
-            # Send message
-            response = chat.send_message(
-                f"{system_prompt}\n\nUser: {user_message}",
-                config={"max_output_tokens": 500}
-            )
-            
-            elapsed = time.time() - start_time
-            logger.info(f"✅ Chat call successful in {elapsed:.2f}s")
-            
-            return response.text
-        
-        except Exception as e:
-            logger.error(f"Chat call failed on attempt {attempt + 1}/{max_retries}: {str(e)}")
-            
-            if attempt < max_retries - 1:
-                wait_time = min(2 ** attempt, 8)
-                logger.info(f"Retrying in {wait_time}s...")
-                time.sleep(wait_time)
-            else:
-                raise Exception(f"❌ Chat Error after {max_retries} attempts: {str(e)}")
+    try:
+        logger.info("🔥 Warming up the local model (loading into VRAM)...")
+        start = time.time()
+        call_llm("hi", max_tokens=1)
+        logger.info(f"✅ Model warmed up in {time.time() - start:.2f}s and ready!")
+    except Exception as e:
+        logger.warning(f"⚠️ Warm-up failed: {e}")
+
+
+# Backward compatibility: agent.py still imports call_gemini
+call_gemini = call_llm
+
 
 if __name__ == "__main__":
-    # Test the brain
-    test_prompt = "What is 2+2?"
-    try:
-        result = call_gemini(test_prompt)
-        logger.info(f"Test result: {result}")
-    except Exception as e:
-        logger.error(f"Test failed: {str(e)}")
+    logging.basicConfig(level=logging.INFO)
+    check_server()
+    print("Testing model...")
+    print(call_llm("What is 2+2? Answer in one word."))

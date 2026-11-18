@@ -1,6 +1,7 @@
 # tools/tool_registry.py
 
-from tools.time_tools import get_time, echo, add_numbers
+
+from tools.time_tools import get_time, get_date, echo, add_numbers
 from memory.database import remember, recall, add_task, list_tasks, complete_task, get_history
 
 TOOLS_LIST = [
@@ -9,7 +10,12 @@ TOOLS_LIST = [
     # ============================================================
     {
         "name": "get_time",
-        "description": "Gets the current date and time. Use when the user asks for the time or date.",
+        "description": "Gets the current  time. Use when the user asks for the time",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "get_date", 
+        "description": "Gets today's date. Use when the user asks for the date or day.",
         "input_schema": {"type": "object", "properties": {}}
     },
     {
@@ -122,6 +128,8 @@ TOOL_FUNCTIONS = {
     "get_time": get_time,
     "echo": echo,
     "add_numbers": add_numbers,
+
+    "get_date": get_date,
     
     # Phase 2 - Memory
     "remember": remember,

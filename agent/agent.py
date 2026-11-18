@@ -1,11 +1,10 @@
 import os
 import sys
 import json
-import re
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -17,351 +16,260 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools.tool_registry import TOOLS_LIST, TOOL_FUNCTIONS
-from brain.brain import call_gemini
-from memory.database import log_interaction, remember, recall,init_database
+from memory.database import log_interaction, init_database
+from memory.obsidian_sync import ObsidianSync
+from brain.brain import call_llm, check_server, warm_up
+from brain.prompts import build_system_prompt, describe_tools
+from brain.router import route
 
-# Load environment variables
 load_dotenv()
 
-# Constants
 MAX_INPUT_LENGTH = 1000
-API_TIMEOUT = 60.0
+API_TIMEOUT = 30.0 
 
-# System Prompt (Phase 1 + Phase 2)
-SYSTEM_PROMPT = """
-You are Jarvis, a helpful desktop assistant. Address the user as 'ma'am'.
-Always be concise and natural in responses.
-
-When you need to use a tool, reply with ONLY the JSON object(s).
-Do NOT add any extra text before or after the JSON.
-
-For single tool: {"tool": "get_time", "args": {}}
-For multiple tools: [{"tool": "tool1", "args": {}}, {"tool": "tool2", "args": {}}]
-
-AVAILABLE TOOLS:
-- get_time: Gets the current date and time.
-- echo: Repeats back whatever the user said.
-- add_numbers: Adds two numbers together.
-- remember: Saves a fact to long-term memory.
-- recall: Retrieves facts from memory.
-- add_task: Adds a task to the to-do list.
-- list_tasks: Lists all tasks.
-- complete_task: Marks a task as complete.
-
-If you don't need a tool, reply naturally without any JSON.
-Keep responses concise and helpful.
-"""
+# Tools whose result is already a friendly sentence: skip the 2nd LLM call
+DIRECT_TOOLS = {
+    "get_time", "get_date", "remember", "recall",
+    "add_task", "list_tasks", "complete_task", "get_history",
+    "echo", # ✅ Added echo here to skip the second LLM call
+}
 
 @dataclass
 class ToolCall:
-    """Represents a parsed tool call."""
     tool: str
     args: Dict[str, Any]
 
+
 class ToolValidator:
-    """Validates tool arguments against schema."""
-    
     @staticmethod
     def validate(tool_name: str, tool_args: Dict[str, Any]) -> Tuple[bool, str]:
-        """
-        Validate tool arguments.
-        Returns: (is_valid, error_message)
-        """
-        # Find tool schema
-        tool_schema = None
-        for tool in TOOLS_LIST:
-            if tool["name"] == tool_name:
-                tool_schema = tool
-                break
-        
+        tool_schema = next((t for t in TOOLS_LIST if t["name"] == tool_name), None)
         if not tool_schema:
             return False, f"Tool '{tool_name}' not found in registry"
-        
-        # Get properties
-        properties = tool_schema.get("input_schema", {}).get("properties", {})
-        
-        # Check for missing required arguments
+
         required = tool_schema.get("input_schema", {}).get("required", [])
         for prop_name in required:
             if prop_name not in tool_args:
                 return False, f"Missing required argument '{prop_name}' for tool '{tool_name}'"
-        
-        # Check for unexpected arguments
-        for arg_name in tool_args:
-            if arg_name not in properties:
-                logger.warning(f"Unexpected argument '{arg_name}' for tool '{tool_name}'")
-        
+
         return True, ""
 
+
 class ToolCallParser:
-    """Robust JSON extractor that searches anywhere in the response."""
-    
-    JSON_PATTERN = re.compile(r'\[\s*\{[^[\]]*\}\s*(?:,\s*\{[^[\]]*\})*\s*\]|\{[^{}]*"tool"[^{}]*"args"[^{}]*\}')
-    
+    """Robust parser that uses JSON decoder to find tool calls anywhere in text."""
+    @staticmethod
+    def _as_calls(data) -> List[ToolCall]:
+        items = data if isinstance(data, list) else [data]
+        calls = []
+        for item in items:
+            if isinstance(item, dict) and isinstance(item.get("tool"), str):
+                # Handle both 'args' and 'arguments', and missing args
+                args = item.get("args", item.get("arguments"))
+                calls.append(ToolCall(tool=item["tool"], args=args if isinstance(args, dict) else {}))
+        return calls
+
     @staticmethod
     def parse(response_text: str) -> List[ToolCall]:
-        """Extract tool call(s) from response (supports single or batch)."""
-        tool_calls = []
-        match = ToolCallParser.JSON_PATTERN.search(response_text)
-        
-        if match:
-            json_str = match.group(0)
-            try:
-                data = json.loads(json_str)
-                
-                if isinstance(data, list):
-                    for item in data:
-                        if isinstance(item, dict) and "tool" in item and "args" in item:
-                            tool_calls.append(ToolCall(tool=item["tool"], args=item["args"]))
-                elif isinstance(data, dict) and "tool" in data and "args" in data:
-                    tool_calls.append(ToolCall(tool=data["tool"], args=data["args"]))
-                
-                logger.debug(f"Parsed {len(tool_calls)} tool call(s)")
-                return tool_calls
-            except json.JSONDecodeError as e:
-                logger.warning(f"JSON parsing failed: {str(e)}")
-        
-        # Fallback: brace matching
-        return ToolCallParser._parse_with_braces(response_text)
-    
-    @staticmethod
-    def _parse_with_braces(response_text: str) -> List[ToolCall]:
-        """Fallback parser using brace matching."""
-        tool_calls = []
-        start = response_text.find('{')
-        
-        while start != -1:
-            brace_count = 0
-            for i in range(start, len(response_text)):
-                if response_text[i] == '{':
-                    brace_count += 1
-                elif response_text[i] == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        try:
-                            json_str = response_text[start:i+1]
-                            data = json.loads(json_str)
-                            if "tool" in data and "args" in data:
-                                tool_calls.append(ToolCall(tool=data["tool"], args=data["args"]))
-                        except json.JSONDecodeError:
-                            pass
-                        start = response_text.find('{', i+1)
-                        break
-            else:
-                break
-        
-        return tool_calls
+        decoder = json.JSONDecoder()
+        calls, i = [], 0
+        while i < len(response_text):
+            if response_text[i] in "[{":
+                try:
+                    data, end = decoder.raw_decode(response_text, i)
+                    found = ToolCallParser._as_calls(data)
+                    if found:
+                        calls.extend(found)
+                        i = end
+                        continue
+                except json.JSONDecodeError:
+                    pass
+            i += 1
+        return calls
+
+
+TYPE_CASTS = {"integer": int, "number": float, "string": str}
+
+def clean_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop hallucinated args and cast values to the schema's types."""
+    schema = next((t for t in TOOLS_LIST if t["name"] == tool_name), None)
+    if not schema:
+        return args
+    props = schema["input_schema"].get("properties", {})
+    cleaned = {}
+    for name, value in args.items():
+        if name not in props:
+            continue
+        cast = TYPE_CASTS.get(props[name].get("type"))
+        try:
+            cleaned[name] = cast(value) if cast and value is not None else value
+        except (TypeError, ValueError):
+            cleaned[name] = value
+    return cleaned
+
 
 class ToolBatcher:
-    """Handles batching and parallel execution of tools."""
-    
     @staticmethod
     async def execute_tool_async(tool_name: str, tool_args: Dict[str, Any]) -> Tuple[str, Any]:
-        """Execute single tool asynchronously with validation."""
         try:
-            # Validate arguments first
+            # Clean and cast args before validating
+            tool_args = clean_args(tool_name, tool_args)
+            
             is_valid, error_msg = ToolValidator.validate(tool_name, tool_args)
             if not is_valid:
-                logger.error(f"Validation error for tool '{tool_name}': {error_msg}")
                 return (tool_name, f"Error: {error_msg}")
-            
+
             if tool_name in TOOL_FUNCTIONS:
                 result = TOOL_FUNCTIONS[tool_name](**tool_args)
-                logger.info(f"✅ Tool '{tool_name}' executed successfully")
                 return (tool_name, result)
             else:
-                logger.error(f"Tool '{tool_name}' not found in TOOL_FUNCTIONS")
                 return (tool_name, f"Unknown tool '{tool_name}'")
         except Exception as e:
-            logger.error(f"Tool '{tool_name}' execution failed: {str(e)}", exc_info=True)
             return (tool_name, f"Error executing tool: {str(e)}")
-    
+
     @staticmethod
-    async def execute_tools_in_parallel(tool_calls: List[ToolCall]) -> Dict[str, Any]:
-        """Execute multiple tools in parallel."""
+    async def execute_tools_in_parallel(tool_calls: List[ToolCall]) -> List[Tuple[str, Any]]:
+        # Return a list of tuples instead of a dict to prevent overwriting duplicate tools
         if not tool_calls:
-            return {}
-        
-        tasks = [
-            ToolBatcher.execute_tool_async(tc.tool, tc.args)
-            for tc in tool_calls
-        ]
-        
-        results = await asyncio.gather(*tasks)
-        return {tool_name: result for tool_name, result in results}
+            return []
+        return list(await asyncio.gather(
+            *[ToolBatcher.execute_tool_async(tc.tool, tc.args) for tc in tool_calls]
+        ))
+
 
 class JarvisAgent:
-    """Main Jarvis AI Agent with improved error handling."""
-    
     def __init__(self):
+        # 1. Check if Ollama is running
+        check_server()
+        
+        # 2. Initialize SQLite database
         init_database()
+        
+        # 3. 🔥 Load the model into VRAM so the first command is fast
+        warm_up()
+        
+        # 4. Setup the parsers and prompts
         self.parser = ToolCallParser()
         self.batcher = ToolBatcher()
-        self._build_tool_descriptions()
+        self.system_prompt = build_system_prompt(describe_tools(TOOLS_LIST))
         logger.info("🦾 Jarvis Agent initialized")
-    
-    def _build_tool_descriptions(self):
-        """Pre-build tool descriptions."""
-        self.tool_descriptions = "\n".join([
-            f"- {t['name']}: {t['description']} (args: {t['input_schema']['properties']})"
-            for t in TOOLS_LIST
-        ])
-    
+
     def _sanitize_input(self, user_input: str) -> Tuple[bool, str]:
-        """
-        Sanitize user input.
-        Returns: (is_valid, sanitized_input)
-        """
         if not user_input:
             return False, "Input is empty"
-        
         if len(user_input) > MAX_INPUT_LENGTH:
-            return False, f"Input too long (max {MAX_INPUT_LENGTH} characters)"
-        
+            return False, "Input too long"
         return True, user_input.strip()
-    
+
     def process_command(self, user_input: str) -> str:
-        """Process a user command, log everything, and return a response."""
-        
-        # Sanitize input
         is_valid, sanitized = self._sanitize_input(user_input)
         if not is_valid:
-            error_msg = f"Invalid input: {sanitized}"
-            logger.warning(error_msg)
-            log_interaction(command=user_input, error=error_msg)
-            return error_msg
-        
+            return f"Invalid input: {sanitized}"
+
         logger.info(f"Processing command: {sanitized[:100]}...")
-        
-        decision_prompt = f"""{SYSTEM_PROMPT}
 
-AVAILABLE TOOLS:
-{self.tool_descriptions}
+        # Router: zero LLM calls for simple commands
+        local_result = route(sanitized)
+        if local_result:
+            logger.info("⚡ Handled by local router")
+            log_interaction(command=sanitized, tool_called="router", result=local_result)
+            return local_result
 
-User command: {sanitized}
-"""
-        
+        # Ollama brain: for everything the router can't handle
         try:
-            # Step 1: Get decision from Brain
-            response_text = call_gemini(decision_prompt)
+            response_text = call_llm(sanitized, system=self.system_prompt, temperature=0.1)
             tool_calls = self.parser.parse(response_text)
-            
+
             if tool_calls:
                 try:
-                    # Step 2: Execute tools in parallel with timeout protection
                     results = asyncio.run(asyncio.wait_for(
                         self._execute_tool_batch(tool_calls),
                         timeout=API_TIMEOUT
                     ))
-                    
-                    tools_used = ', '.join([tc.tool for tc in tool_calls])
-                    results_str = "\n".join([f"{tool}: {result}" for tool, result in results.items()])
-                    
-                    # Step 3: Get final reply from Brain
-                    final_prompt = f"""You executed tools and got results. Provide a natural response.
 
+                    tools_used = ', '.join([tc.tool for tc in tool_calls])
+                    results_str = "\n".join(f"{tool}: {result}" for tool, result in results)
+
+                    # ✅ Check if any tool failed and report it honestly!
+                    failed = [r for _, r in results
+                              if isinstance(r, str) and r.startswith(("Error", "Unknown tool", "❌"))]
+                    if failed:
+                        log_interaction(command=sanitized, tool_called=tools_used, result=results_str, error=failed[0])
+                        return f"Sorry ma'am, that failed: {failed[0]}"
+
+                    # Single simple tool: its result is already a clean sentence
+                    if len(tool_calls) == 1 and tool_calls[0].tool in DIRECT_TOOLS:
+                        final_response = str(results[0][1])
+                    else:
+                        final_prompt = f"""You executed tools and got results. Provide a natural response.
 User asked: "{sanitized}"
 Tools executed: {tools_used}
 Tool results:
 {results_str}
+Give a concise, helpful response."""
+                        final_response = call_llm(
+                            final_prompt,
+                            system="You are Jarvis. Address the user as 'ma'am'. Be brief.",
+                            temperature=0.5,
+                        )
 
-Give a concise, helpful response based on these results."""
-                    
-                    final_response = call_gemini(final_prompt)
-                    
-                    # Step 4: LOG EVERYTHING to history
-                    log_interaction(
-                        command=sanitized,
-                        tool_called=tools_used,
-                        result=results_str,
-                        error=None
-                    )
-                    
-                    logger.info(f"✅ Command processed successfully")
+                    log_interaction(command=sanitized, tool_called=tools_used, result=results_str, error=None)
                     return final_response
-                
+
                 except asyncio.TimeoutError:
-                    error_msg = f"Tool execution timeout (max {API_TIMEOUT}s)"
-                    logger.error(error_msg)
-                    log_interaction(command=sanitized, error=error_msg)
-                    return error_msg
+                    log_interaction(command=sanitized, error="Tool timeout")
+                    return "Tool execution timeout."
                 except Exception as e:
-                    error_msg = f"Error executing tools: {str(e)}"
-                    logger.error(error_msg, exc_info=True)
-                    log_interaction(command=sanitized, error=error_msg)
-                    return error_msg
+                    log_interaction(command=sanitized, error=str(e))
+                    return f"Error executing tools: {str(e)}"
             else:
-                # No tool called — just reply naturally
-                logger.info("No tools needed for this command")
-                log_interaction(
-                    command=sanitized,
-                    tool_called=None,
-                    result=response_text,
-                    error=None
-                )
+                log_interaction(command=sanitized, result=response_text)
                 return response_text
-        
+
         except Exception as e:
-            error_msg = f"Error processing command: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            log_interaction(command=sanitized, error=error_msg)
-            return error_msg
-    
-    async def _execute_tool_batch(self, tool_calls: List[ToolCall]) -> Dict[str, Any]:
-        """Execute batch of tools in parallel."""
+            log_interaction(command=sanitized, error=str(e))
+            return f"Error processing command: {str(e)}"
+
+    async def _execute_tool_batch(self, tool_calls: List[ToolCall]) -> List[Tuple[str, Any]]:
         if not tool_calls:
-            return {}
-        
-        logger.info(f"🔧 Executing {len(tool_calls)} tool(s): {', '.join(tc.tool for tc in tool_calls)}")
+            return []
         return await self.batcher.execute_tools_in_parallel(tool_calls)
-    
+
     def run_interactive(self):
-        """Run interactive mode."""
         print("🦾 Jarvis is online. Type 'exit' to quit.\n")
-        logger.info("Agent started in interactive mode")
-        
         while True:
             try:
                 user_input = input("You: ").strip()
-                
                 if not user_input:
                     continue
-                
-                if "exit" in user_input.lower() or "quit" in user_input.lower() or "bye" in user_input.lower():
+
+                if user_input.lower() in ["exit", "quit", "bye"]:
                     print("Jarvis: Goodbye!")
-                    logger.info("Agent shutdown requested by user")
-                    
-                    #adding obsidain sync before exit
                     try:
-                        from memory.obsidian_sync import ObsidianSync
                         ObsidianSync().sync_all()
                     except Exception as e:
-                        logger.error(f"Obsidian sync failed : {e}")
+                        logger.error(f"Obsidian sync failed: {e}")
                     break
-                
+
                 response = self.process_command(user_input)
                 print(f"Jarvis: {response}\n")
-                
+
             except KeyboardInterrupt:
                 print("\nJarvis: Interrupted. Goodbye!")
-                logger.info("Agent interrupted by user (KeyboardInterrupt)")
-
-                #sync on ctr+c
                 try:
-                    from memory.obsidian_sync import ObsidianSync
-                    obsidainSync().sync_all()
+                    ObsidianSync().sync_all()
                 except Exception as e:
-                    logger.error(f"Obsidian sync failed : {e}")
+                    logger.error(f"Obsidian sync failed: {e}")
                 break
             except Exception as e:
-                error_msg = f"❌ Error: {str(e)}"
-                print(f"{error_msg}\n")
-                logger.error(error_msg, exc_info=True)
+                print(f"❌ Error: {str(e)}\n")
+
 
 if __name__ == "__main__":
     try:
         agent = JarvisAgent()
         agent.run_interactive()
     except Exception as e:
-        logger.critical(f"Fatal error: {str(e)}", exc_info=True)
-        print(f"❌ Fatal error: {str(e)}")
+        print(f"\n❌ FATAL STARTUP ERROR: {e}")
+        # ✅ This line prevents the window from closing instantly so you can read the error!
+        input("\nPress Enter to close this window...") 
+        sys.exit(1)
